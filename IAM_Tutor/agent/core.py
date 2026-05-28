@@ -19,7 +19,14 @@ from .tools import (
 # 상수 (Single Source of Truth)
 # ─────────────────────────────────────────────────────────────────────────────
 LLM_TEMPERATURE = 0.1
-LLM_MAX_RETRIES = 5
+
+# ReAct 본 에이전트용 (스트리밍, 재시도 여유 있게)
+AGENT_LLM_MAX_RETRIES = 3
+
+# Vision 추출용 (단발 호출, 짧고 빠르게 실패하도록)
+VISION_LLM_MAX_RETRIES = 1
+VISION_REQUEST_TIMEOUT = 30  # 초
+
 AGENT_MAX_ITERATIONS = 10
 HISTORY_TURNS = 3
 HISTORY_PREVIEW_CHARS = 100
@@ -94,11 +101,22 @@ class IAMAgent:
     """IAM Tutor ReAct 에이전트 핵심 클래스."""
 
     def __init__(self):
+        # ── ReAct 메인 LLM (스트리밍 ON)
         self.llm = ChatGoogleGenerativeAI(
             model=LLM_MODEL_NAME,
             temperature=LLM_TEMPERATURE,
             streaming=True,
-            max_retries=LLM_MAX_RETRIES,
+            max_retries=AGENT_LLM_MAX_RETRIES,
+        )
+
+        # ── Vision 추출 전용 LLM (스트리밍 OFF, 짧은 타임아웃, 재시도 최소화)
+        #    실패 시 빠르게 폴백하도록 분리. 본 LLM의 streaming/max_retries=5에 영향받지 않음.
+        self.vision_llm = ChatGoogleGenerativeAI(
+            model=LLM_MODEL_NAME,
+            temperature=LLM_TEMPERATURE,
+            streaming=False,
+            max_retries=VISION_LLM_MAX_RETRIES,
+            timeout=VISION_REQUEST_TIMEOUT,
         )
 
         self.tools = [
@@ -121,14 +139,12 @@ class IAMAgent:
 
     @staticmethod
     def _load_prompt():
-        """LangChain Hub에서 ReAct 프롬프트를 로드하되, 실패 시 안전한 폴백을 사용한다."""
         try:
             return hub.pull("hwchase17/react")
         except Exception:
             return PromptTemplate.from_template(REACT_FALLBACK_TEMPLATE)
 
     def _build_level_instructions(self, user_level: str) -> str:
-        """수준 키를 받아 시스템 프롬프트에 주입할 지침 문자열을 만든다."""
         level_info = LEVEL_MAP.get(user_level, LEVEL_MAP[DEFAULT_LEVEL_KEY])
         return (
             f"*** [현재 사용자 수준: {user_level}] ***\n"
@@ -147,22 +163,20 @@ class IAMAgent:
         ]
         return "\n[이전 대화]\n" + "\n".join(lines)
 
-    def _extract_chords_from_image(self, image) -> str:
+    def _extract_chords_from_image(self, image_bytes: bytes, image_mime: Optional[str]) -> str:
         """Gemini Vision으로 악보 이미지에서 코드 진행만 추출한다.
 
-        반환값:
+        Args:
+            image_bytes: 이미지 원본 바이트.
+            image_mime: 이미지 MIME 타입 (예: 'image/png').
+
+        Returns:
             정상 추출 시: "[이미지에서 추출된 코드 진행]\\n<코드>\\n"
             추출 실패 시: 실패 사실을 알리는 안내 문자열.
         """
         try:
-            if hasattr(image, "seek"):
-                image.seek(0)
-            img_bytes = image.read()
-            if hasattr(image, "seek"):
-                image.seek(0)
-
-            mime = getattr(image, "type", None) or DEFAULT_IMAGE_MIME
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            mime = image_mime or DEFAULT_IMAGE_MIME
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
             vision_msg = HumanMessage(
                 content=[
@@ -173,7 +187,7 @@ class IAMAgent:
                     },
                 ]
             )
-            response = self.llm.invoke([vision_msg])
+            response = self.vision_llm.invoke([vision_msg])
             extracted = (response.content or "").strip()
 
             if not extracted or VISION_FAILURE_SENTINEL in extracted:
@@ -193,15 +207,16 @@ class IAMAgent:
         query: str,
         chat_history: Optional[list] = None,
         user_level: str = DEFAULT_LEVEL_KEY,
-        image=None,
+        image_bytes: Optional[bytes] = None,
+        image_mime: Optional[str] = None,
     ):
-        """에이전트에게 질의를 보낸다. image가 주어지면 Vision으로 코드를 먼저 추출한다."""
+        """에이전트에게 질의를 보낸다. image_bytes가 주어지면 Vision으로 코드를 먼저 추출한다."""
         level_instructions = self._build_level_instructions(user_level)
         history_text = self._format_history(chat_history)
 
         image_context = ""
-        if image is not None:
-            image_context = self._extract_chords_from_image(image)
+        if image_bytes is not None:
+            image_context = self._extract_chords_from_image(image_bytes, image_mime)
 
         full_query = (
             f"{SYSTEM_MESSAGE}\n\n"

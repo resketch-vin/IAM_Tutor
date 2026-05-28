@@ -29,41 +29,57 @@ GOAL_OPTIONS = [
 
 IMAGE_ANALYSIS_QUERY = "업로드한 악보 이미지에 포함된 코드 진행을 정확히 추출한 뒤, 그 진행을 화성학적으로 분석하고 연주 가이드를 제시해줘."
 SUPPORTED_IMAGE_TYPES = ["png", "jpg", "jpeg"]
+DEFAULT_IMAGE_MIME = "image/png"
 NEXT_QUESTIONS_MARKER = "Next Questions:"
 MAX_SUGGESTIONS = 3
+
+# 세션 상태 키
+SS_AGENT = "agent"
+SS_MESSAGES = "messages"
+SS_USER_LEVEL = "user_level"
+SS_DIAGNOSED = "diagnosed"
+SS_QUICK_ACTION = "quick_action"
+SS_PENDING_IMAGE = "pending_image"  # {"bytes": ..., "mime": ..., "name": ...}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 페이지 설정 및 세션 상태 초기화
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 
-if "agent" not in st.session_state:
+if SS_AGENT not in st.session_state:
     with st.spinner("🎸 튜터가 지식 베이스를 점검 중입니다... 잠시만 기다려주세요."):
-        st.session_state.agent = IAMAgent()
+        st.session_state[SS_AGENT] = IAMAgent()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if SS_MESSAGES not in st.session_state:
+    st.session_state[SS_MESSAGES] = []
 
-if "user_level" not in st.session_state:
-    st.session_state.user_level = None
+if SS_USER_LEVEL not in st.session_state:
+    st.session_state[SS_USER_LEVEL] = None
 
-if "diagnosed" not in st.session_state:
-    st.session_state.diagnosed = False
+if SS_DIAGNOSED not in st.session_state:
+    st.session_state[SS_DIAGNOSED] = False
 
-if "quick_action" not in st.session_state:
-    st.session_state.quick_action = None
+if SS_QUICK_ACTION not in st.session_state:
+    st.session_state[SS_QUICK_ACTION] = None
+
+if SS_PENDING_IMAGE not in st.session_state:
+    st.session_state[SS_PENDING_IMAGE] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 공용 헬퍼: 사용자 입력 처리 (NameError 방지를 위해 최상단에 정의)
+# 공용 헬퍼
 # ─────────────────────────────────────────────────────────────────────────────
-def process_user_input(user_query: str, image=None) -> None:
-    """사용자 질의(텍스트/이미지)를 에이전트에 전달하고 응답을 스트리밍 표시한다."""
-    st.session_state.messages.append({"role": "user", "content": user_query})
+def process_user_input(user_query: str, image_payload: dict = None) -> None:
+    """사용자 질의를 에이전트에 전달하고 응답을 같은 실행 사이클에 표시한다.
+
+    image_payload: {"bytes": <bytes>, "mime": <str>, "name": <str>} 또는 None
+    """
+    st.session_state[SS_MESSAGES].append({"role": "user", "content": user_query})
+
     with st.chat_message("user"):
         st.markdown(user_query)
-        if image is not None:
-            st.image(image, caption="분석에 사용된 악보", use_container_width=True)
+        if image_payload is not None:
+            st.image(image_payload["bytes"], caption=image_payload.get("name", "분석에 사용된 악보"), use_container_width=True)
 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
@@ -71,14 +87,15 @@ def process_user_input(user_query: str, image=None) -> None:
 
         try:
             with st.status("🎸 튜터가 화성학적 원리를 분석 중입니다...", expanded=True) as status:
-                if image is not None:
-                    st.write("🖼️ **악보 이미지에서 코드 추출 중...**")
+                if image_payload is not None:
+                    st.write("🖼️ **악보 이미지에서 코드 추출 중...** (Gemini Vision 호출)")
 
-                stream = st.session_state.agent.ask(
+                stream = st.session_state[SS_AGENT].ask(
                     user_query,
-                    st.session_state.messages[:-1],
-                    user_level=st.session_state.user_level,
-                    image=image,
+                    st.session_state[SS_MESSAGES][:-1],
+                    user_level=st.session_state[SS_USER_LEVEL],
+                    image_bytes=(image_payload["bytes"] if image_payload else None),
+                    image_mime=(image_payload["mime"] if image_payload else None),
                 )
 
                 for chunk in stream:
@@ -95,13 +112,13 @@ def process_user_input(user_query: str, image=None) -> None:
         except Exception as e:
             full_response = f"죄송합니다. 분석 중 오류가 발생했습니다: {str(e)}"
             message_placeholder.markdown(full_response)
+            st.error(full_response)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
-    st.rerun()
+    st.session_state[SS_MESSAGES].append({"role": "assistant", "content": full_response})
+    # NOTE: st.rerun()은 호출하지 않는다. 같은 실행 사이클 안에서 모든 출력을 끝까지 그린다.
 
 
 def _resolve_level_from_experience(experience: str) -> str:
-    """라디오 라벨에서 내부 수준 키를 안전하게 추출한다."""
     for level_key, label in LEVEL_LABELS.items():
         if label == experience:
             return level_key
@@ -109,7 +126,6 @@ def _resolve_level_from_experience(experience: str) -> str:
 
 
 def _extract_next_questions(content: str) -> list:
-    """응답 본문 끝의 'Next Questions:' 영역에서 후속 질문 후보를 정제하여 추출한다."""
     if NEXT_QUESTIONS_MARKER not in content:
         return []
     raw = content.split(NEXT_QUESTIONS_MARKER, maxsplit=1)[1].strip()
@@ -122,6 +138,13 @@ def _extract_next_questions(content: str) -> list:
     return suggestions[:MAX_SUGGESTIONS]
 
 
+def _consume_pending_image() -> dict:
+    """대기 중인 이미지를 꺼내고 세션 상태를 비운다 (1회용)."""
+    payload = st.session_state[SS_PENDING_IMAGE]
+    st.session_state[SS_PENDING_IMAGE] = None
+    return payload
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 사이드바
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,12 +152,13 @@ with st.sidebar:
     st.title("🎸 IAM Tutor")
     st.markdown("---")
 
-    if st.session_state.user_level:
-        st.info(f"**현재 설정된 수준:** {st.session_state.user_level}")
+    if st.session_state[SS_USER_LEVEL]:
+        st.info(f"**현재 설정된 수준:** {st.session_state[SS_USER_LEVEL]}")
         if st.button("수준 다시 설정하기"):
-            st.session_state.diagnosed = False
-            st.session_state.user_level = None
-            st.session_state.messages = []
+            st.session_state[SS_DIAGNOSED] = False
+            st.session_state[SS_USER_LEVEL] = None
+            st.session_state[SS_MESSAGES] = []
+            st.session_state[SS_PENDING_IMAGE] = None
             st.rerun()
 
     st.markdown("---")
@@ -149,18 +173,19 @@ with st.sidebar:
     )
 
     if st.button("대화 초기화"):
-        st.session_state.messages = [
+        st.session_state[SS_MESSAGES] = [
             {
                 "role": "assistant",
-                "content": f"안녕하세요! {st.session_state.user_level} 수준에 맞춰 새로운 마음으로 다시 시작해볼까요? 분석하고 싶은 코드 진행을 알려주세요! 🎸",
+                "content": f"안녕하세요! {st.session_state[SS_USER_LEVEL]} 수준에 맞춰 새로운 마음으로 다시 시작해볼까요? 분석하고 싶은 코드 진행을 알려주세요! 🎸",
             }
         ]
+        st.session_state[SS_PENDING_IMAGE] = None
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 메인 UI 로직
 # ─────────────────────────────────────────────────────────────────────────────
-if not st.session_state.diagnosed:
+if not st.session_state[SS_DIAGNOSED]:
     st.title("🎸 IAM Tutor: 맞춤형 진단")
     st.subheader("당신에게 꼭 맞는 튜터링을 위해 몇 가지만 여쭤볼게요!")
 
@@ -177,51 +202,58 @@ if not st.session_state.diagnosed:
         submitted = st.form_submit_button("진단 완료 및 시작하기")
 
         if submitted:
-            st.session_state.user_level = _resolve_level_from_experience(experience)
-            st.session_state.diagnosed = True
+            st.session_state[SS_USER_LEVEL] = _resolve_level_from_experience(experience)
+            st.session_state[SS_DIAGNOSED] = True
 
             welcome_msg = (
-                f"반갑습니다! **{st.session_state.user_level}** 수준에 맞춰 정교한 화성학 분석을 제공해 드릴게요. "
+                f"반갑습니다! **{st.session_state[SS_USER_LEVEL]}** 수준에 맞춰 정교한 화성학 분석을 제공해 드릴게요. "
             )
-            st.session_state.messages.append({"role": "assistant", "content": welcome_msg})
+            st.session_state[SS_MESSAGES].append({"role": "assistant", "content": welcome_msg})
             st.rerun()
 
 else:
     # 대화 인터페이스
     st.title("🎼 AI Guitar Tutor: IAM Tutor")
-    st.caption(f"RAG 기반 지능형 화성학 분석 | **현재 수준: {st.session_state.user_level}**")
+    st.caption(f"RAG 기반 지능형 화성학 분석 | **현재 수준: {st.session_state[SS_USER_LEVEL]}**")
 
-    # 사용법 가이드
     with st.expander("📖 **IAM Tutor 사용법 가이드**", expanded=False):
         st.markdown(
             f"""
             1. **코드 진행 입력**: 아래 입력창에 분석하고 싶은 코드 진행을 적어주세요.
                *   예: "C - G - Am - F" 또는 "키: G major, 진행: G-D-Em-C"
             2. **악보 이미지 분석**: 아래 업로드 섹션에 악보 이미지를 올리면 코드를 추출해 드립니다.
-            3. **맞춤형 분석**: 현재 **{st.session_state.user_level}** 수준에 맞춰 화성학적 원리와 연주 팁을 알려드립니다.
+            3. **맞춤형 분석**: 현재 **{st.session_state[SS_USER_LEVEL]}** 수준에 맞춰 화성학적 원리와 연주 팁을 알려드립니다.
             """
         )
 
-    # 악보 이미지 업로드 섹션
+    # ── 악보 이미지 업로드: 버튼 클릭 시 분석을 직접 호출하지 않고
+    #    pending_image에 바이트만 저장한 뒤 rerun. 본문 흐름에서 처리한다.
     with st.expander("🖼️ **악보 이미지로 분석하기 (Beta)**", expanded=False):
         uploaded_file = st.file_uploader(
             "코드 악보 이미지를 업로드하세요",
             type=SUPPORTED_IMAGE_TYPES,
+            key="image_uploader",
         )
-        if uploaded_file:
+        if uploaded_file is not None:
             st.image(uploaded_file, caption="업로드된 악보", use_container_width=True)
-            if st.button("이미지에서 코드 추출 및 분석 시작"):
-                process_user_input(IMAGE_ANALYSIS_QUERY, image=uploaded_file)
+            if st.button("이미지에서 코드 추출 및 분석 시작", key="btn_image_analyze"):
+                st.session_state[SS_PENDING_IMAGE] = {
+                    "bytes": uploaded_file.getvalue(),
+                    "mime": uploaded_file.type or DEFAULT_IMAGE_MIME,
+                    "name": uploaded_file.name,
+                }
+                st.session_state[SS_QUICK_ACTION] = IMAGE_ANALYSIS_QUERY
+                st.rerun()
 
     # 대화 기록 표시
-    for message in st.session_state.messages:
+    for message in st.session_state[SS_MESSAGES]:
         with st.chat_message(message["role"]):
             display_content = message["content"].split(NEXT_QUESTIONS_MARKER)[0].strip()
             st.markdown(display_content)
 
-    # 마지막 어시스턴트 메시지에서 후속 질문 버튼 노출
-    if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
-        suggestions = _extract_next_questions(st.session_state.messages[-1]["content"])
+    # 후속 질문 버튼
+    if st.session_state[SS_MESSAGES] and st.session_state[SS_MESSAGES][-1]["role"] == "assistant":
+        suggestions = _extract_next_questions(st.session_state[SS_MESSAGES][-1]["content"])
         if suggestions:
             st.markdown("---")
             st.caption("💡 **이어서 이런 질문은 어떠신가요?**")
@@ -229,28 +261,34 @@ else:
             for idx, suggestion in enumerate(suggestions):
                 with cols[idx]:
                     if st.button(suggestion, key=f"suggest_btn_{idx}", use_container_width=True):
-                        st.session_state.quick_action = suggestion
+                        st.session_state[SS_QUICK_ACTION] = suggestion
                         st.rerun()
 
-    # 퀵 액션 버튼 (화성학 분석 중심)
+    # 퀵 액션 버튼
     st.markdown("---")
     quick_cols = st.columns(4)
     with quick_cols[0]:
         if st.button("🎼 1-4-5 진행 분석"):
-            st.session_state.quick_action = "가장 기본적인 C-F-G 1-4-5 진행의 화성학적 원리를 설명해줘."
+            st.session_state[SS_QUICK_ACTION] = "가장 기본적인 C-F-G 1-4-5 진행의 화성학적 원리를 설명해줘."
+            st.rerun()
     with quick_cols[1]:
         if st.button("✨ 세컨더리 도미넌트"):
-            st.session_state.quick_action = "C - E7 - Am 진행에서 E7의 역할(세컨더리 도미넌트)이 뭐야?"
+            st.session_state[SS_QUICK_ACTION] = "C - E7 - Am 진행에서 E7의 역할(세컨더리 도미넌트)이 뭐야?"
+            st.rerun()
     with quick_cols[2]:
         if st.button("아련한 IVm 분석"):
-            st.session_state.quick_action = "C - F - Fm - C 진행에서 Fm(모달 인터체인지)은 왜 쓰이는 거야?"
+            st.session_state[SS_QUICK_ACTION] = "C - F - Fm - C 진행에서 Fm(모달 인터체인지)은 왜 쓰이는 거야?"
+            st.rerun()
     with quick_cols[3]:
         if st.button("🎸 연주 가이드 요청"):
-            st.session_state.quick_action = "G - D/F# - Em - C 진행을 부드럽게 연주하는 팁을 알려줘."
+            st.session_state[SS_QUICK_ACTION] = "G - D/F# - Em - C 진행을 부드럽게 연주하는 팁을 알려줘."
+            st.rerun()
 
     prompt = st.chat_input("분석하고 싶은 코드 진행을 입력하세요 (예: C-G-Am-F)")
-    user_query = prompt or st.session_state.quick_action
 
+    # ── 실제 분석 트리거: chat_input > quick_action 순으로 우선
+    user_query = prompt or st.session_state[SS_QUICK_ACTION]
     if user_query:
-        st.session_state.quick_action = None
-        process_user_input(user_query)
+        st.session_state[SS_QUICK_ACTION] = None
+        image_payload = _consume_pending_image()
+        process_user_input(user_query, image_payload=image_payload)
